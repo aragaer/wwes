@@ -1,0 +1,6 @@
+[submodule "eveapi"]
+	path = eveapi
+	url = git://github.com/ntt/eveapi.git
+[submodule "reverence"]
+	path = reverence
+	url = git://github.com/ntt/reverence.git
