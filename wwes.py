@@ -22,6 +22,9 @@ resolved_types = {
 resolved_locations = {
 }
 
+resolved_containers = {
+}
+
 def type_name(id):
 	if id in resolved_types:
 		return resolved_types[id]
@@ -35,6 +38,49 @@ def quantity(q):
 		return "Copy"
 	else:
 		return "x%d" % q
+
+def chunks(l):
+	l = list(l)
+	for i in range(0, len(l), 250):
+		yield ",".join(map(str, l[i:i+250]))
+
+class Item(object):
+	def __init__(self, tid, q, location, rawQ=None):
+		self.tid = tid
+		self.q = rawQ or q or 1
+		self.location = location
+	def __str__(self):
+		return "%s %s" % (resolved_types[self.tid], quantity(self.q))
+
+class Location(object):
+	item = None
+	sublocations = {}
+	def __init__(self, lid):
+		self.lid = lid
+
+	def set_item(self, item):
+		self.item = item
+
+	def append(self, item, sublocation):
+		if not sublocation in self.sublocations:
+			self.sublocations[sublocation] = []
+		self.sublocations[sublocation].append(item)
+
+	def flags(self):
+		return self.sublocations.keys()
+
+	def get_by_flag(self, sublocation):
+		return self.sublocations[sublocation]
+
+	def is_object(self):
+		return not self.item is None
+
+	def __str__(self):
+		if self.item is None:
+			return "Station %s" % resolved_locations[self.lid]
+		if self.item.tid == 27:
+			return "Office %s slot %d" % (resolved_locations[self.item.location[0]], self.item.location[1] - 69)
+		return "%s '%s'" % (resolved_types[self.item.tid], resolved_containers[self.lid])
 
 my_format = "{0:<30}:{1:>20,.2f}".format
 class CorpState(object):
@@ -76,14 +122,10 @@ class CorpState(object):
 			self.wallets[account.accountKey]['balance'] = b
 			self.balance += b
 
-		self.assets = {}
-		self.neat_assets = {}
-		self.containers = {}
-		self.offices = []
-		self.deliveries = {}
+		assets = {}
 		types = {}
-		stuff_location = {}
 		locations = {}
+		self.locations = {}
 		for c in auth.corp.AssetList(flat=1).assets:
 #			if self.debug:
 #				print("Got %s x%d %d in %s" % (type_name(c.typeID), c.quantity or 1, c.itemID, self.location(c)))
@@ -93,72 +135,67 @@ class CorpState(object):
 				q = c.quantity
 			else:
 				q = 1
-			self.assets[(c.typeID, c.locationID, c.flag)] = q
+			item = Item(c.typeID, q, (c.locationID, c.flag))
+
+			assets[c.itemID] = item
 			if not c.typeID in resolved_types:
 				types[c.typeID] = 1
 
-			if not c.locationID in self.neat_assets:
-				self.neat_assets[c.locationID] = {}
+			if not c.locationID in self.locations:
+				self.locations[c.locationID] = Location(c.locationID)
 
-			if not c.flag in self.neat_assets[c.locationID]:
-				self.neat_assets[c.locationID][c.flag] = {}
+			self.locations[c.locationID].append(item, c.flag)
 
-			self.neat_assets[c.locationID][c.flag][c.typeID] = q
+			# is this object a container?
+			if c.itemID in self.locations:
+				self.locations[c.itemID].set_item(item)
 
-			stuff_location[c.itemID] = c.locationID
-			if not c.locationID in self.containers:
-				if c.locationID in stuff_location:
-					self.containers[c.locationID] = stuff_location[c.locationID][0]
-				else:
-					self.containers[c.locationID] = 0
-			elif c.itemID in self.containers:
-				self.containers[c.itemID] = c.locationID
-			stuff_location[c.itemID] = (c.locationID, c.flag)
+			# have we seen the container before?
+			if c.locationID in assets:
+				self.locations[c.locationID].set_item(assets[c.locationID])
 
-			if c.typeID == 27: # Office
-				self.offices.append(c.itemID)
-				locations[c.locationID] = 1
-			if c.flag == 62:
-				self.deliveries[c.locationID] = 1
-				locations[c.locationID] = 1
-
-		self.deliveries = list(self.deliveries.keys())
-
-		types = list(types.keys())
-		for type_chunk in [types[i:i+250] for i in range(0, len(types), 250)]:
-			for t in api.eve.TypeName(ids=",".join(map(str, type_chunk))).types:
+		# resolve type names
+		for type_chunk in chunks(types.keys()):
+			for t in api.eve.TypeName(ids=type_chunk).types:
 				resolved_types[t.typeID] = t.typeName
 
-		for office in self.offices:
-			print("Got office %s in %s (%d)" % (office, stuff_location[office][0], stuff_location[office][1]))
-
+		containers_to_resolve = []
 		locations_to_resolve = {}
-		for l in locations.keys():
-			if l >= 66000000 and l < 67000000:
-				locations_to_resolve[l - 6000001] = l
-			elif l >= 67000000 and l < 68000000:
-				locations_to_resolve[l - 6000000] = l
+		for i, c in self.locations.items():
+			if c.is_object():
+				if c.item.tid != 27: # 27 is Office
+					containers_to_resolve.append(i)
 			else:
-				locations_to_resolve[l] = l
-		ll = list(locations_to_resolve.keys())
+				# these have to be modified first
+				if i >= 66000000 and i < 67000000:
+					locations_to_resolve[i - 6000001] = i
+				elif i >= 67000000 and i < 68000000:
+					locations_to_resolve[i - 6000000] = i
+				else:
+					locations_to_resolve[i] = i
 
-		# Using CharacterName to resolve station names!
-		for l_chunk in [ll[i:i+250] for i in range(0, len(ll), 250)]:
-			for l in api.eve.CharacterName(IDs=",".join(map(str, l_chunk))).characters:
+		# resolve location names
+		# using CharacterName to resolve station names!
+		for l_chunk in chunks(locations_to_resolve.keys()):
+			for l in api.eve.CharacterName(IDs=l_chunk).characters:
 				resolved_locations[locations_to_resolve[l.characterID]] = l.name
 
-		if debug and False:
-			for ((tid, lid, flag), q) in self.assets.items():
-				print("Got %s %s in %s" % (type_name(tid), quantity(q), lid))
+		# resolve container names
+		for c_chunk in chunks(containers_to_resolve):
+			for c in auth.corp.Locations(ids=c_chunk).locations:
+				resolved_containers[c.itemID] = c.itemName
 
-		for office in self.offices:
-			print("Got office %s in %s Slot %d" % (office, resolved_locations[stuff_location[office][0]], stuff_location[office][1] - 69))
+		for l in self.locations.values():
+			print(l)
 
 	def print(self):
 		print("Corporation \"%s\"" % self.name)
+		print()
+		print("Wallets:")
 		for i, w in self.wallets.items():
-			print(my_format(w['name'], w['balance']))
-		print(my_format("Total", self.balance))
+			print("\t", my_format(w['name'], w['balance']))
+		print("\t", my_format("Total", self.balance))
+		print()
 		print(my_format("Shares", self.shares))
 		print(my_format("Per share", self.balance/self.shares))
 		print()
@@ -254,7 +291,7 @@ class WWESConfig(object):
 		return this in self.data
 
 if __name__ == "__main__":
-	api = EVEAPIConnection(cacheHandler=MyCacheHandler(debug=True))
+	api = EVEAPIConnection(cacheHandler=MyCacheHandler(debug=debug))
 	current_state = CorpState(debug=debug)
 	cfg = WWESConfig()
 
