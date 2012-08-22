@@ -2,13 +2,19 @@
 
 from eveapi.eveapi import EVEAPIConnection
 import pickle, zlib
-import os
-from os.path import join, exists
+import os, errno
 import tempfile
 import time
 from itertools import chain
+from sqlalchemy import *
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+import argparse
 
-debug = True
+cfg = None
+metadata = MetaData()
+Base = declarative_base(metadata=metadata)
+
 resolved_types = {
 	27:		'Office',
 	654:		'Iteron Mark II',
@@ -44,19 +50,44 @@ def chunks(l):
 	for i in range(0, len(l), 250):
 		yield ",".join(map(str, l[i:i+250]))
 
-class Item(object):
-	def __init__(self, tid, q, location, rawQ=None):
+class Item(Base):
+	__tablename__ = 'assets'
+	id = Column(Integer, primary_key=True)
+	tid = Column(Integer)
+	quantity = Column(Integer)
+	location = Column(Integer)
+	flag = Column(Integer)
+	name = Column(String(100))
+
+	def __init__(self, id, tid, q, location, flag, rawQ=None):
+		self.id = id
 		self.tid = tid
-		self.q = rawQ or q or 1
+		self.quantity = rawQ or q or 1
 		self.location = location
+		self.flag = flag
+		self.contents = None
+
 	def __str__(self):
-		return "%s %s" % (resolved_types[self.tid], quantity(self.q))
+		return "%s %s" % (resolved_types[self.tid], quantity(self.quantity))
+
+	def is_container(self):
+		return not self.contents is None;
+
+class Division(Base):
+	__tablename__ = 'divisions'
+	id = Column(Integer, primary_key=True)
+	w_name = Column(String(100))
+	h_name = Column(String(100))
+	balance = Column(Float)
+
+	def __init__(self, id):
+		self.id = id
 
 class Location(object):
 	item = None
-	sublocations = {}
 	def __init__(self, lid):
 		self.lid = lid
+		self.sublocations = {}
 
 	def set_item(self, item):
 		self.item = item
@@ -79,17 +110,24 @@ class Location(object):
 		if self.item is None:
 			return "Station %s" % resolved_locations[self.lid]
 		if self.item.tid == 27:
-			return "Office %s slot %d" % (resolved_locations[self.item.location[0]], self.item.location[1] - 69)
+			return "Office %s slot %d" % (resolved_locations[self.item.location], self.item.flag - 69)
 		return "%s '%s'" % (resolved_types[self.item.tid], resolved_containers[self.lid])
 
 my_format = "{0:<30}:{1:>20,.2f}".format
-class CorpState(object):
+class CorpState(Base):
+	__tablename__ = 'overview'
+	id = Column(Integer, primary_key=True)
+	name = Column(String(100))
+	ticker = Column(String(5))
+	shares = Column(Integer)
+	ceo = Column(Integer)
+	alliance = Column(Integer)
+	tax = Column(Float)
+	members = Column(Integer)
+	date = Column(Integer)
+
 	def __init__(self, debug=False):
 		self.debug = debug
-
-	def location(self, row):
-		office = row.locationID
-		return "%s flag %s" % (office, row.flag)
 
 	def fetch(self, keyID, vCode):
 		auth = api.auth(keyID=keyID, vCode=vCode)
@@ -99,15 +137,24 @@ class CorpState(object):
 
 		self.date = time.time()
 
-		self.name = key.characters[0].corporationName
-
 		info = auth.corp.CorporationSheet()
-		self.wallets = {}
-		self.hangars = {}
+		self.divisions = {}
 		for wallet in info.walletDivisions:
-			self.wallets[wallet.accountKey] = {'name': wallet.description}
+			division = Division(wallet.accountKey)
+			division.w_name = wallet.description
+			self.divisions[wallet.accountKey] = division
 		for hangar in info.divisions:
-			self.hangars[hangar.accountKey] = hangar.description
+			self.divisions[hangar.accountKey].h_name = hangar.description
+
+		self.id = info.corporationID
+		self.ticker = info.ticker
+		self.dumps_dir = os.path.join(cfg.dumps, self.ticker) 
+
+		self.name = info.corporationName
+		self.members = info.memberCount
+		self.ceo = info.ceoID
+		self.alliance = info.allianceID
+		self.tax = info.taxRate
 
 		self.shares = 0
 		self.shareholders = []
@@ -119,13 +166,14 @@ class CorpState(object):
 		self.balance = 0.0
 		for account in auth.corp.AccountBalance().accounts:
 			b = float(account.balance)
-			self.wallets[account.accountKey]['balance'] = b
+			self.divisions[account.accountKey].balance = b
 			self.balance += b
 
-		assets = {}
+		self.assets = {}
 		types = {}
 		locations = {}
 		self.locations = {}
+		self.offices = []
 		for c in auth.corp.AssetList(flat=1).assets:
 #			if self.debug:
 #				print("Got %s x%d %d in %s" % (type_name(c.typeID), c.quantity or 1, c.itemID, self.location(c)))
@@ -135,9 +183,9 @@ class CorpState(object):
 				q = c.quantity
 			else:
 				q = 1
-			item = Item(c.typeID, q, (c.locationID, c.flag))
+			item = Item(c.itemID, c.typeID, q, c.locationID, c.flag)
 
-			assets[c.itemID] = item
+			self.assets[c.itemID] = item
 			if not c.typeID in resolved_types:
 				types[c.typeID] = 1
 
@@ -149,10 +197,12 @@ class CorpState(object):
 			# is this object a container?
 			if c.itemID in self.locations:
 				self.locations[c.itemID].set_item(item)
+				item.contents = self.locations[c.itemID]
 
 			# have we seen the container before?
-			if c.locationID in assets:
-				self.locations[c.locationID].set_item(assets[c.locationID])
+			if c.locationID in self.assets:
+				self.locations[c.locationID].set_item(self.assets[c.locationID])
+				self.assets[c.locationID].contents = self.locations[c.locationID]
 
 		# resolve type names
 		for type_chunk in chunks(types.keys()):
@@ -163,7 +213,9 @@ class CorpState(object):
 		locations_to_resolve = {}
 		for i, c in self.locations.items():
 			if c.is_object():
-				if c.item.tid != 27: # 27 is Office
+				if c.item.tid == 27: # 27 is Office
+					self.offices.append(i)
+				else:
 					containers_to_resolve.append(i)
 			else:
 				# these have to be modified first
@@ -185,19 +237,83 @@ class CorpState(object):
 			for c in auth.corp.Locations(ids=c_chunk).locations:
 				resolved_containers[c.itemID] = c.itemName
 
-		for l in self.locations.values():
+
+		for i, v in self.assets.items():
+			if i in self.locations:
+				if v.tid == 27:
+					v.name = "Slot %d" % (v.flag - 69)
+				else:
+					v.name = resolved_containers[i]
+
+		return
+
+		for i, l in self.locations.items():
 			print(l)
+			for f in l.flags():
+				print("\t", f)
+
+	def save(self):
+		if not os.path.exists(self.dumps_dir):
+			os.makedirs(self.dumps_dir)
+		self.db = create_engine('sqlite:///%s/%d.db' % (self.dumps_dir, self.date), echo=self.debug)
+		metadata.create_all(bind=self.db)
+		s = sessionmaker(bind=self.db)()
+		s.add_all(list(self.assets.values()))
+		s.add_all(list(self.divisions.values()))
+		s.add(self)
+		s.commit()
+
+	def load_prev(self):
+		names = os.listdir(current_state.dumps_dir)
+		if not names:
+			return None
+
+		db = create_engine('sqlite:///%s/%s' % (self.dumps_dir, max(names)), echo=self.debug)
+		s = sessionmaker(bind=db)()
+		loaded = s.query(CorpState).first()
+		loaded.db = db
+		loaded.debug = self.debug
+
+		loaded.load_from_db()
+		return loaded
+
+	def load_from_db(self):
+		# implement this!
+		pass
 
 	def print(self):
 		print("Corporation \"%s\"" % self.name)
 		print()
 		print("Wallets:")
-		for i, w in self.wallets.items():
-			print("\t", my_format(w['name'], w['balance']))
+		for i, w in self.divisions.items():
+			print("\t", my_format(w.w_name, w.balance))
 		print("\t", my_format("Total", self.balance))
 		print()
 		print(my_format("Shares", self.shares))
 		print(my_format("Per share", self.balance/self.shares))
+		print()
+		print("Offices:")
+		for oid in self.offices:
+			office = self.locations[oid]
+			print("\t", office)
+			for s in office.flags():
+				if s == 4:
+					hangar = self.divisions[1000]
+				else:
+					hangar = self.divisions[1000 + s - 115]
+				print("\t\t", hangar.h_name)
+				for i in office.get_by_flag(s):
+					if i.is_container():
+						print("\t\t\t", i.contents)
+						for f in i.contents.flags():
+							if f == 63:
+								print("\t\t\tLocked")
+							else:
+								print("\t\t\tUnlocked")
+							for ii in i.contents.get_by_flag(f):
+								print("\t\t\t\t", ii)
+					else:
+						print("\t\t\t", i)
 		print()
 
 class MyCacheHandler(object):
@@ -205,8 +321,8 @@ class MyCacheHandler(object):
 		self.debug = debug
 		self.count = 0
 		self.cache = {}
-		self.tempdir = join(tempfile.gettempdir(), "eveapi")
-		if not exists(self.tempdir):
+		self.tempdir = os.path.join(tempfile.gettempdir(), "eveapi")
+		if not os.path.exists(self.tempdir):
 			os.makedirs(self.tempdir)
 
 	def log(self, what):
@@ -225,8 +341,8 @@ class MyCacheHandler(object):
 			cacheFile = None
 		else:
 			# it wasn't cached in memory, but it might be on disk.
-			cacheFile = join(self.tempdir, str(key) + ".cache")
-			if exists(cacheFile):
+			cacheFile = os.path.join(self.tempdir, str(key) + ".cache")
+			if os.path.exists(cacheFile):
 				self.log("%s: retrieving from disk" % path)
 				f = open(cacheFile, "rb")
 				cached = self.cache[key] = pickle.loads(zlib.decompress(f.read()))
@@ -263,7 +379,7 @@ class MyCacheHandler(object):
 			cached = self.cache[key] = (cachedUntil, doc)
 
 			# store in cache folder
-			cacheFile = join(self.tempdir, str(key) + ".cache")
+			cacheFile = os.path.join(self.tempdir, str(key) + ".cache")
 			with open(cacheFile, "wb") as f:
 				f.write(zlib.compress(pickle.dumps(cached, -1)))
 
@@ -284,6 +400,16 @@ class WWESConfig(object):
 
 		self.data['keys'] = chain.from_iterable([readfile(f, ':') for f in self.data['keys']])
 
+		for p in ['dumps', 'reports']:
+			self.data[p] = os.path.expanduser(self.data[p][0])
+			try:
+				os.makedirs(self.data[p])
+			except OSError as exc:
+				if exc.errno == errno.EEXIST:
+					pass
+				else:
+					raise
+
 	def __getattr__(self, this):
 		return self.data[this]
 
@@ -291,15 +417,22 @@ class WWESConfig(object):
 		return this in self.data
 
 if __name__ == "__main__":
-	api = EVEAPIConnection(cacheHandler=MyCacheHandler(debug=debug))
-	current_state = CorpState(debug=debug)
+	parser = argparse.ArgumentParser()
+	parser.add_argument("--debug", help="Show lots of debug output", action="store_true")
+	parser.add_argument("--no-save", help="Do not save the current state", action="store_true")
+	parser.add_argument("--quiet", help="Do not print corporation data", action="store_true")
+	args = parser.parse_args()
+
+	api = EVEAPIConnection(cacheHandler=MyCacheHandler(debug=args.debug))
+	current_state = CorpState(debug=args.debug)
 	cfg = WWESConfig()
 
 	for (keyID, vCode) in cfg.keys:
 		try:
 			current_state.fetch(keyID, vCode)
+			pass
 		except Exception as e:
-			if debug:
+			if args.debug:
 				print(str(e))
 				raise
 			continue
@@ -309,5 +442,19 @@ if __name__ == "__main__":
 		print("No working key pair found")
 		exit(-1)
 
-	current_state.print()
+	if not args.quiet:
+		current_state.print()
+
+	prev_state = current_state.load_prev()
+
+	if not args.no_save:
+		current_state.save()
+
+	if not prev_state:
+		print("No previous dumps found")
+		exit(0)
+
+	# compare stuff
+	# also fetch transactions in between
+	# store everything as report
 
