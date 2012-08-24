@@ -25,16 +25,15 @@ resolved_types = {
 	1270092916:	'Station Vault',
 }
 
-resolved_locations = {
-}
+resolved_locations = {}
 
-resolved_containers = {
-}
+resolved_containers = {}
 
 def type_name(id):
 	return resolved_types.get(id) or ("Type %d" % id)
 
 def quantity(q):
+	"""Convert 'quantity' into string"""
 	if q == -1:
 		return "Original"
 	elif q == -2:
@@ -43,11 +42,13 @@ def quantity(q):
 		return "x%d" % q
 
 def chunks(l):
+	"""Split list into chunks no longer than 250 items each"""
 	l = list(l)
 	for i in range(0, len(l), 250):
 		yield l[i:i+250]
 
 class Item(Base):
+	"""Single object in assets lists"""
 	__tablename__ = 'assets'
 	id = Column(Integer, primary_key=True)
 	tid = Column(Integer)
@@ -70,6 +71,7 @@ class Item(Base):
 		return 'contents' in self.__dict__;
 
 class Division(Base):
+	"""Wallet and hangar. Might not be actually associated, just having same ID."""
 	__tablename__ = 'divisions'
 	id = Column(Integer, primary_key=True)
 	w_name = Column(String(100))
@@ -80,10 +82,12 @@ class Division(Base):
 		self.id = id
 
 class Location(object):
-	item = None
+	"""Something where other items could be located"""
 	def __init__(self, lid):
+		self.item = None
 		self.lid = lid
 		self.sublocations = {}
+		self.name = None
 
 	def set_item(self, item):
 		self.item = item
@@ -103,14 +107,21 @@ class Location(object):
 		return self.item is not None
 
 	def __str__(self):
-		if self.item is None:
-			return "Station %s" % resolved_locations[self.lid]
-		if self.item.tid == 27:
-			return "Office %s slot %d" % (resolved_locations[self.item.location], self.item.flag - 69)
-		return "%s '%s'" % (resolved_types[self.item.tid], self.item.name)
+		if self.name:
+			return self.name
+		item = self.item
+		if item is None:
+			self.name = "Station %s" % resolved_locations[self.lid]
+		elif self.item.tid == 27:
+			self.name = "Office %s slot %d" % (resolved_locations[item.location], item.flag - 69)
+		else:
+			self.name = "%s '%s'" % (resolved_types[item.tid], item.name)
+		return self.name
 
 my_format = "{0:<30}:{1:>20,.2f}".format
 class CorpState(Base):
+	"""A snapshot of a corporation state."""
+
 	__tablename__ = 'overview'
 	id = Column(Integer, primary_key=True)
 	name = Column(String(100))
@@ -126,6 +137,7 @@ class CorpState(Base):
 		self.debug = debug
 
 	def fetch(self, keyID, vCode):
+		"""Get data from API"""
 		self.auth = api.auth(keyID=keyID, vCode=vCode)
 		key = self.auth.account.ApiKeyInfo().key
 		if key.type != 'Corporation' or key.expires != "" and time.time() < key.expires:
@@ -180,6 +192,7 @@ class CorpState(Base):
 		self.process_assets()
 
 	def process_assets(self):
+		"""Group assets by containers, resolve names and type names."""
 		self.offices = []
 		self.locations = {}
 		types = {}
@@ -248,6 +261,7 @@ class CorpState(Base):
 					v.name = resolved_containers[i]
 
 	def save(self):
+		"""Store state to database"""
 		if not os.path.exists(self.dumps_dir):
 			os.makedirs(self.dumps_dir)
 		self.db = create_engine('sqlite:///%s/%d.db' % (self.dumps_dir, self.date), echo=self.debug)
@@ -259,6 +273,7 @@ class CorpState(Base):
 		s.commit()
 
 	def load_prev(self):
+		"""Find previous dump and load it."""
 		names = os.listdir(current_state.dumps_dir)
 		if not names:
 			return None
@@ -278,6 +293,7 @@ class CorpState(Base):
 		return loaded
 
 	def load_from_db(self):
+		"""Load data from database."""
 		s = sessionmaker(bind=self.db)()
 		self.divisions = {d.id: d for d in s.query(Division).all()}
 		self.balance = sum([d.balance for d in self.divisions.values()])
@@ -286,6 +302,7 @@ class CorpState(Base):
 
 	# should be rewritten to properly recurse through assets
 	def print(self):
+		"""Print corporation state in readable format."""
 		print("Corporation \"%s\"" % self.name)
 		print()
 		print("Wallets:")
@@ -388,12 +405,14 @@ class MyCacheHandler(object):
 				f.write(zlib.compress(pickle.dumps(cached, -1)))
 
 def readfile(filename, separator="="):
+	"""Slurp configuration file, return list of pairs"""
 	with open(filename) as f:
 		for line in map(str.strip, f.readlines()):
 			if not line.startswith('#'):
 				yield map(str.strip, line.split(separator))
 
-class WWESConfig(object):
+class Config(object):
+	"""Application configuration"""
 	data = {}
 	def __init__(self, path = 'config'):
 		for (key, value) in readfile(path):
@@ -429,7 +448,7 @@ if __name__ == "__main__":
 
 	api = EVEAPIConnection(cacheHandler=MyCacheHandler(debug=args.debug))
 	current_state = CorpState(debug=args.debug)
-	cfg = WWESConfig()
+	cfg = Config()
 
 	for (keyID, vCode) in cfg.keys:
 		try:
