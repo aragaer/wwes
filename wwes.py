@@ -32,10 +32,7 @@ resolved_containers = {
 }
 
 def type_name(id):
-	if id in resolved_types:
-		return resolved_types[id]
-	else:
-		return "Type %d" % id
+	return resolved_types.get(id) or ("Type %d" % id)
 
 def quantity(q):
 	if q == -1:
@@ -48,7 +45,7 @@ def quantity(q):
 def chunks(l):
 	l = list(l)
 	for i in range(0, len(l), 250):
-		yield ",".join(map(str, l[i:i+250]))
+		yield l[i:i+250]
 
 class Item(Base):
 	__tablename__ = 'assets'
@@ -65,13 +62,12 @@ class Item(Base):
 		self.quantity = rawQ or q or 1
 		self.location = location
 		self.flag = flag
-		self.contents = None
 
 	def __str__(self):
 		return "%s %s" % (resolved_types[self.tid], quantity(self.quantity))
 
 	def is_container(self):
-		return not self.contents is None;
+		return 'contents' in self.__dict__;
 
 class Division(Base):
 	__tablename__ = 'divisions'
@@ -93,7 +89,7 @@ class Location(object):
 		self.item = item
 
 	def append(self, item, sublocation):
-		if not sublocation in self.sublocations:
+		if sublocation not in self.sublocations:
 			self.sublocations[sublocation] = []
 		self.sublocations[sublocation].append(item)
 
@@ -104,14 +100,14 @@ class Location(object):
 		return self.sublocations[sublocation]
 
 	def is_object(self):
-		return not self.item is None
+		return self.item is not None
 
 	def __str__(self):
 		if self.item is None:
 			return "Station %s" % resolved_locations[self.lid]
 		if self.item.tid == 27:
 			return "Office %s slot %d" % (resolved_locations[self.item.location], self.item.flag - 69)
-		return "%s '%s'" % (resolved_types[self.item.tid], resolved_containers[self.lid])
+		return "%s '%s'" % (resolved_types[self.item.tid], self.item.name)
 
 my_format = "{0:<30}:{1:>20,.2f}".format
 class CorpState(Base):
@@ -130,14 +126,14 @@ class CorpState(Base):
 		self.debug = debug
 
 	def fetch(self, keyID, vCode):
-		auth = api.auth(keyID=keyID, vCode=vCode)
-		key = auth.account.ApiKeyInfo().key
+		self.auth = api.auth(keyID=keyID, vCode=vCode)
+		key = self.auth.account.ApiKeyInfo().key
 		if key.type != 'Corporation' or key.expires != "" and time.time() < key.expires:
 			raise ValueError
 
 		self.date = time.time()
 
-		info = auth.corp.CorporationSheet()
+		info = self.auth.corp.CorporationSheet()
 		self.divisions = {}
 		for wallet in info.walletDivisions:
 			division = Division(wallet.accountKey)
@@ -158,23 +154,19 @@ class CorpState(Base):
 
 		self.shares = 0
 		self.shareholders = []
-		holders = auth.corp.ShareHolders()
+		holders = self.auth.corp.ShareHolders()
 		for sh in chain(holders.characters, holders.corporations):
 			self.shareholders.append((sh.shareholderName, sh.shares))
 			self.shares += sh.shares
 
 		self.balance = 0.0
-		for account in auth.corp.AccountBalance().accounts:
+		for account in self.auth.corp.AccountBalance().accounts:
 			b = float(account.balance)
 			self.divisions[account.accountKey].balance = b
 			self.balance += b
 
 		self.assets = {}
-		types = {}
-		locations = {}
-		self.locations = {}
-		self.offices = []
-		for c in auth.corp.AssetList(flat=1).assets:
+		for c in self.auth.corp.AssetList(flat=1).assets:
 #			if self.debug:
 #				print("Got %s x%d %d in %s" % (type_name(c.typeID), c.quantity or 1, c.itemID, self.location(c)))
 			if 'rawQuantity' in c:
@@ -183,26 +175,35 @@ class CorpState(Base):
 				q = c.quantity
 			else:
 				q = 1
-			item = Item(c.itemID, c.typeID, q, c.locationID, c.flag)
+			self.assets[c.itemID] = Item(c.itemID, c.typeID, q, c.locationID, c.flag)
 
-			self.assets[c.itemID] = item
-			if not c.typeID in resolved_types:
-				types[c.typeID] = 1
+		self.process_assets()
 
-			if not c.locationID in self.locations:
-				self.locations[c.locationID] = Location(c.locationID)
+	def process_assets(self):
+		self.offices = []
+		self.locations = {}
+		types = {}
+		locations = {}
+		for i in self.assets.values():
+			if not i.tid in resolved_types:
+				types[i.tid] = 1
+			if i.tid == 27:
+				self.offices.append(i.id)
 
-			self.locations[c.locationID].append(item, c.flag)
+			if not i.location in self.locations:
+				self.locations[i.location] = Location(i.location)
+
+			self.locations[i.location].append(self.assets[i.id], i.flag)
 
 			# is this object a container?
-			if c.itemID in self.locations:
-				self.locations[c.itemID].set_item(item)
-				item.contents = self.locations[c.itemID]
+			if i.id in self.locations:
+				self.locations[i.id].set_item(self.assets[i.id])
+				self.assets[i.id].contents = self.locations[i.id]
 
 			# have we seen the container before?
-			if c.locationID in self.assets:
-				self.locations[c.locationID].set_item(self.assets[c.locationID])
-				self.assets[c.locationID].contents = self.locations[c.locationID]
+			if i.location in self.assets:
+				self.locations[i.location].set_item(self.assets[i.location])
+				self.assets[i.location].contents = self.locations[i.location]
 
 		# resolve type names
 		for type_chunk in chunks(types.keys()):
@@ -212,10 +213,11 @@ class CorpState(Base):
 		containers_to_resolve = []
 		locations_to_resolve = {}
 		for i, c in self.locations.items():
+			c.name = resolved_locations.get(i) or resolved_containers.get(i)
+			if c.name:
+				continue
 			if c.is_object():
-				if c.item.tid == 27: # 27 is Office
-					self.offices.append(i)
-				else:
+				if c.item.tid != 27: # 27 is Office
 					containers_to_resolve.append(i)
 			else:
 				# these have to be modified first
@@ -234,7 +236,7 @@ class CorpState(Base):
 
 		# resolve container names
 		for c_chunk in chunks(containers_to_resolve):
-			for c in auth.corp.Locations(ids=c_chunk).locations:
+			for c in self.auth.corp.Locations(ids=c_chunk).locations:
 				resolved_containers[c.itemID] = c.itemName
 
 
@@ -244,13 +246,6 @@ class CorpState(Base):
 					v.name = "Slot %d" % (v.flag - 69)
 				else:
 					v.name = resolved_containers[i]
-
-		return
-
-		for i, l in self.locations.items():
-			print(l)
-			for f in l.flags():
-				print("\t", f)
 
 	def save(self):
 		if not os.path.exists(self.dumps_dir):
@@ -268,7 +263,12 @@ class CorpState(Base):
 		if not names:
 			return None
 
+		# max(names) does alphabetical sort
+		# since each 'name' is <unix timestamp>.db this is ok for now
+		# it will break on Sat, 20 Nov 2286 17:46:40 GMT though
+		# not sure if python3 will still be available by that time
 		db = create_engine('sqlite:///%s/%s' % (self.dumps_dir, max(names)), echo=self.debug)
+
 		s = sessionmaker(bind=db)()
 		loaded = s.query(CorpState).first()
 		loaded.db = db
@@ -278,9 +278,13 @@ class CorpState(Base):
 		return loaded
 
 	def load_from_db(self):
-		# implement this!
-		pass
+		s = sessionmaker(bind=self.db)()
+		self.divisions = {d.id: d for d in s.query(Division).all()}
+		self.balance = sum([d.balance for d in self.divisions.values()])
+		self.assets = {i.id: i for i in s.query(Item).all()}
+		self.process_assets()
 
+	# should be rewritten to properly recurse through assets
 	def print(self):
 		print("Corporation \"%s\"" % self.name)
 		print()
@@ -430,7 +434,6 @@ if __name__ == "__main__":
 	for (keyID, vCode) in cfg.keys:
 		try:
 			current_state.fetch(keyID, vCode)
-			pass
 		except Exception as e:
 			if args.debug:
 				print(str(e))
@@ -441,6 +444,9 @@ if __name__ == "__main__":
 	else:
 		print("No working key pair found")
 		exit(-1)
+
+	# free the chain and opened files and other stuff
+	cfg.keys = None
 
 	if not args.quiet:
 		current_state.print()
