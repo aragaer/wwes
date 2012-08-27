@@ -15,18 +15,9 @@ cfg = None
 metadata = MetaData()
 Base = declarative_base(metadata=metadata)
 
-resolved_types = {
-	27:		'Office',
-	654:		'Iteron Mark II',
-	2203:		'Acolyte I',
-	2454:		'Hobgoblin I',
-	23087:		'Amarr Encryption Method',
-	90877978:	'Station Container',
-	1270092916:	'Station Vault',
-}
-
+#TODO: Store resolved_locations and resolved_types between runs
+resolved_types = {}
 resolved_locations = {}
-
 resolved_containers = {}
 
 def type_name(id):
@@ -57,13 +48,6 @@ class Item(Base):
 	flag = Column(Integer)
 	name = Column(String(100))
 
-	def __init__(self, id, tid, q, location, flag, rawQ=None):
-		self.id = id
-		self.tid = tid
-		self.quantity = rawQ or q or 1
-		self.location = location
-		self.flag = flag
-
 	def __str__(self):
 		return "%s %s" % (resolved_types[self.tid], quantity(self.quantity))
 
@@ -77,9 +61,6 @@ class Division(Base):
 	w_name = Column(String(100))
 	h_name = Column(String(100))
 	balance = Column(Float)
-
-	def __init__(self, id):
-		self.id = id
 
 class Location(object):
 	"""Something where other items could be located"""
@@ -106,6 +87,7 @@ class Location(object):
 	def is_object(self):
 		return self.item is not None
 
+	# FIXME: What about anchored stuff?
 	def __str__(self):
 		if self.name:
 			return self.name
@@ -148,8 +130,7 @@ class CorpState(Base):
 		info = self.auth.corp.CorporationSheet()
 		self.divisions = {}
 		for wallet in info.walletDivisions:
-			division = Division(wallet.accountKey)
-			division.w_name = wallet.description
+			division = Division(id=wallet.accountKey, w_name=wallet.description)
 			self.divisions[wallet.accountKey] = division
 		for hangar in info.divisions:
 			self.divisions[hangar.accountKey].h_name = hangar.description
@@ -173,21 +154,19 @@ class CorpState(Base):
 
 		self.balance = 0.0
 		for account in self.auth.corp.AccountBalance().accounts:
-			b = float(account.balance)
-			self.divisions[account.accountKey].balance = b
-			self.balance += b
+			self.divisions[account.accountKey].balance = account.balance
+			self.balance += account.balance
 
 		self.assets = {}
 		for c in self.auth.corp.AssetList(flat=1).assets:
-#			if self.debug:
-#				print("Got %s x%d %d in %s" % (type_name(c.typeID), c.quantity or 1, c.itemID, self.location(c)))
 			if 'rawQuantity' in c:
 				q = c.rawQuantity
 			elif 'quantity' in c:
 				q = c.quantity
 			else:
 				q = 1
-			self.assets[c.itemID] = Item(c.itemID, c.typeID, q, c.locationID, c.flag)
+			self.assets[c.itemID] = Item(id=c.itemID, tid=c.typeID,
+					quantity=q, location=c.locationID, flag=c.flag)
 
 		self.process_assets()
 
@@ -198,15 +177,16 @@ class CorpState(Base):
 		types = {}
 		locations = {}
 		for i in self.assets.values():
+			loc = i.location
 			if not i.tid in resolved_types:
 				types[i.tid] = 1
 			if i.tid == 27:
 				self.offices.append(i.id)
 
-			if not i.location in self.locations:
-				self.locations[i.location] = Location(i.location)
+			if loc not in self.locations:
+				self.locations[loc] = Location(loc)
 
-			self.locations[i.location].append(self.assets[i.id], i.flag)
+			self.locations[loc].append(self.assets[i.id], i.flag)
 
 			# is this object a container?
 			if i.id in self.locations:
@@ -215,8 +195,8 @@ class CorpState(Base):
 
 			# have we seen the container before?
 			if i.location in self.assets:
-				self.locations[i.location].set_item(self.assets[i.location])
-				self.assets[i.location].contents = self.locations[i.location]
+				self.locations[loc].set_item(self.assets[loc])
+				self.assets[loc].contents = self.locations[loc]
 
 		# resolve type names
 		for type_chunk in chunks(types.keys()):
