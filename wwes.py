@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-from eveapi.eveapi import EVEAPIConnection
+import eveapi.eveapi as eveapi
 import pickle, zlib
 import os, errno
 import tempfile
@@ -32,6 +32,8 @@ def quantity(q):
 	else:
 		return "x%d" % q
 
+#eveapi.Row.get = lambda self, this: self[this] if this in self else None
+
 def chunks(l):
 	"""Split list into chunks no longer than 250 items each"""
 	l = list(l)
@@ -52,7 +54,7 @@ class Item(Base):
 		return "%s %s" % (resolved_types[self.tid], quantity(self.quantity))
 
 	def is_container(self):
-		return 'contents' in self.__dict__;
+		return 'contents' in self.__dict__
 
 class Division(Base):
 	"""Wallet and hangar. Might not be actually associated, just having same ID."""
@@ -138,6 +140,8 @@ class CorpState(Base):
 		self.id = info.corporationID
 		self.ticker = info.ticker
 		self.dumps_dir = os.path.join(cfg.dumps, self.ticker) 
+		if not os.path.exists(self.dumps_dir):
+			os.makedirs(self.dumps_dir)
 
 		self.name = info.corporationName
 		self.members = info.memberCount
@@ -159,14 +163,9 @@ class CorpState(Base):
 
 		self.assets = {}
 		for c in self.auth.corp.AssetList(flat=1).assets:
-			if 'rawQuantity' in c:
-				q = c.rawQuantity
-			elif 'quantity' in c:
-				q = c.quantity
-			else:
-				q = 1
 			self.assets[c.itemID] = Item(id=c.itemID, tid=c.typeID,
-					quantity=q, location=c.locationID, flag=c.flag)
+					quantity=c.get('rawQuantity') or c.get('quantity') or 1,
+					location=c.locationID, flag=c.flag)
 
 		self.process_assets()
 
@@ -426,7 +425,7 @@ if __name__ == "__main__":
 	parser.add_argument("--quiet", help="Do not print corporation data", action="store_true")
 	args = parser.parse_args()
 
-	api = EVEAPIConnection(cacheHandler=MyCacheHandler(debug=args.debug))
+	api = eveapi.EVEAPIConnection(cacheHandler=MyCacheHandler(debug=args.debug))
 	current_state = CorpState(debug=args.debug)
 	cfg = Config()
 
